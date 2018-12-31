@@ -125,15 +125,6 @@ def get_glibc():
   return glibc
 
 
-def write_setgroups(pid):
-  setgroups_path = '/proc/{}/setgroups'.format(pid)
-  with open(setgroups_path, 'wb') as setgroups:
-    logging.debug("Writing : %s (fd=%d)\n", setgroups_path, setgroups.fileno())
-    # NOTE(josh): was previously "deny", but apt-get calls this so we must
-    # allow it if we want to use apt-get. Look into this more.
-    setgroups.write("deny\n")  # !!
-
-
 def make_sure_is_dir(need_dir, source):
   """
   Ensure that the given path is a directory, removing a regular file if
@@ -297,7 +288,12 @@ def set_userns_idmap(chroot_pid):
   #open('/proc/%d/uid_map' % chroot_pid, 'w').write('0 %d 1\n101 %d 1\n' % (uid, uid + 1))  # Fails: EPERM (Operation not permitted).
   open('/proc/%d/uid_map' % chroot_pid, 'w').write('%d %d 1\n' % (uid, uid))  # OK.
   # !! why groups=65534(nogroup),65534(nogroup),65534(nogroup)?
-  write_setgroups(chroot_pid)
+  setgroups_path = '/proc/{}/setgroups'.format(chroot_pid)
+  with open(setgroups_path, 'wb') as setgroups:
+    logging.debug("Writing : %s (fd=%d)\n", setgroups_path, setgroups.fileno())
+    # NOTE(josh): was previously "deny", but apt-get calls this so we must
+    # allow it if we want to use apt-get. Look into this more.
+    setgroups.write("deny\n")  # !!
   print 'SETGR: %r' % open('/proc/%d/setgroups' % chroot_pid).read()
   print 'GID: %r' % [os.getgid(), os.getegid()]
   f = open('/proc/%d/gid_map' % chroot_pid, 'w'); f.write('%d %d 1\n' % (gid, gid)); f.close()  # !! Why: Fails: EPERM (Operation not permitted).
@@ -338,134 +334,6 @@ def umain(rootfs, binds=None, identity=None, cwd=None):
     enter(primary_read_fd, primary_write_fd, rootfs, binds, identity, cwd)
 
 
-def process_environment(env_dict):
-  """Given an environment dictionary, merge any lists with pathsep and return
-     the new dictionary."""
-  out_dict = {}
-  for key, value in env_dict.iteritems():
-    if isinstance(value, list):
-      out_dict[key] = ':'.join(value)
-    elif isinstance(value, (str, unicode)):
-      out_dict[key] = value
-    else:
-      out_dict[key] = str(value)
-  return out_dict
-
-
-# exec defaults
-#DEFAULT_BIN = '/bin/bash'
-#DEFAULT_ARGV = ['bash']
-DEFAULT_BIN = '/usr/bin/id'
-DEFAULT_ARGV = ['id']  # !!
-DEFAULT_PATH = ['/usr/sbin', '/usr/bin', '/sbin', '/bin']
-
-
-def serialize(obj):
-  """
-  Return a serializable representation of the object. If the object has an
-  `as_dict` method, then it will call and return the output of that method.
-  Otherwise return the object itself.
-  """
-  if hasattr(obj, 'as_dict'):
-    fun = getattr(obj, 'as_dict')
-    if callable(fun):
-      return fun()
-
-  return obj
-
-
-class ConfigObject(object):
-  """
-  Provides simple serialization to a dictionary based on the assumption that
-  all args in the __init__() function are fields of this object.
-  """
-
-  @classmethod
-  def get_field_names(cls):
-    """
-    The order of fields in the tuple representation is the same as the order
-    of the fields in the __init__ function
-    """
-
-    # NOTE(josh): args[0] is `self`
-    return inspect.getargspec(cls.__init__).args[1:]
-
-  def as_dict(self):
-    """
-    Return a dictionary mapping field names to their values only for fields
-    specified in the constructor
-    """
-    return {field: serialize(getattr(self, field))
-            for field in self.get_field_names()}
-
-
-def get_default(obj, default):
-  """
-  If obj is not `None` then return it. Otherwise return default.
-  """
-  if obj is None:
-    return default
-
-  return obj
-
-
-class Exec(ConfigObject):
-  """
-  Simple object to hold together the path, argument vector, and environment
-  of an exec call.
-  """
-
-  def __init__(self, exbin=None, argv=None, env=None, **_):
-    if exbin:
-      self.exbin = exbin
-      if not argv:
-        argv = [exbin.split('/')[-1]]
-    else:
-      self.exbin = DEFAULT_BIN
-
-    if argv:
-      self.argv = argv
-    else:
-      self.argv = DEFAULT_ARGV
-
-    if env is not None:
-      self.env = process_environment(env)
-    else:
-      self.env = process_environment(dict(PATH=DEFAULT_PATH))
-
-  def __call__(self):
-    logging.debug('Executing %s', self.exbin)
-    return os.execve(self.exbin, self.argv, self.env)
-
-  def subprocess(self, preexec_fn=None):
-    logging.debug('Executing %s', self.exbin)
-    return subprocess.call(self.argv, executable=self.exbin, env=self.env,
-                           preexec_fn=preexec_fn)
-
-
-class Main(ConfigObject):
-  """
-  Simple bind for subprocess prexec_fn.
-  """
-
-  def __init__(self,
-               rootfs=None,
-               binds=None,
-               identity=None,
-               cwd=None,
-               **_):
-    self.rootfs = rootfs
-    self.binds = get_default(binds, [])
-    self.identity = get_default(identity, (0, 0))
-
-    uid = os.getuid()
-    username = pwd.getpwuid(uid)[0]
-    self.cwd = get_default(cwd, '/')
-
-  def __call__(self):
-    umain(**self.as_dict())
-
-
 # ---
 
 def main(sys_argv):
@@ -476,23 +344,16 @@ def main(sys_argv):
                       filemode='w')
 
   rootfs = sys_argv[1]
-  argv = ['id']
+  argv = ['id'];  exbin = '/usr/bin/id'
+  #argv = ['bash']; exbin = '/bin/bash'
   env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}
-  exbin = '/usr/bin/id'
   cwd = '/'  # !!
   binds = ['/proc', '/dev/pts', 'tmpfs:/var/tmp']
   #config['binds'].extend(('/proc', '/dev/pts'))  # !!
   identity = (os.getuid(), os.getgid())  # !!
 
-  config = locals()
-  mainobj = Main(**config)
-  execobj = Exec(**config)
-  #assert 0, mainobj.as_dict().keys()  # binds, cwd, identity, rootfs.
-
-  # enter the jail
-  mainobj()
-  # and start the requested program
-  execobj()
+  umain(rootfs=rootfs, binds=binds, identity=identity, cwd=cwd)
+  os.execve(exbin, argv, env)
   logging.error("Failed to start a shell")
   return 1
 
