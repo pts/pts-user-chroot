@@ -6,7 +6,6 @@
 # Based on: git clone https://github.com/cheshirekow/uchroot && cd uchroot && git checkout 4b3cf28765e17f9b6de74fcedfc78a5ace26bb77
 #
 
-import argparse
 import ctypes
 import errno
 import inspect
@@ -166,7 +165,7 @@ def make_sure_is_file(need_path, source):
       touchfile.write('# written by uchroot')
 
 
-def enter(read_fd, write_fd, rootfs=None, binds=None, qemu=None, identity=None,
+def enter(read_fd, write_fd, rootfs=None, binds=None, identity=None,
           cwd=None):
   """
   Chroot into rootfs with a new user and mount namespace, then execute
@@ -257,20 +256,6 @@ def enter(read_fd, write_fd, rootfs=None, binds=None, qemu=None, identity=None,
                    source, rootfs_dest, errno.errorcode.get(err, '??'), err,
                    os.strerror(err))
 
-  if qemu:
-    dest = qemu.lstrip('/')
-    rootfs_dest = os.path.join(rootfs, dest)
-    make_sure_is_dir(os.path.dirname(rootfs_dest), qemu)
-    logging.debug("Installing %s", qemu)
-    with open(rootfs_dest, 'wb') as outfile:
-      with open(qemu, 'rb') as infile:
-        chunk = infile.read(1024 * 4)
-        while chunk:
-          outfile.write(chunk)
-          chunk = infile.read(1024 * 4)
-
-    os.chmod(rootfs_dest, 0755)
-
   # ---------------------------------------------------------------------
   #                             Chroot
   # ---------------------------------------------------------------------
@@ -318,7 +303,7 @@ def set_userns_idmap(chroot_pid):
   f = open('/proc/%d/gid_map' % chroot_pid, 'w'); f.write('%d %d 1\n' % (gid, gid)); f.close()  # !! Why: Fails: EPERM (Operation not permitted).
 
 
-def umain(rootfs, binds=None, qemu=None, identity=None, cwd=None):
+def umain(rootfs, binds=None, identity=None, cwd=None):
   """Fork off a helper subprocess, enter the chroot jail. Wait for the helper
      to  call the setuid-root helper programs and configure the uid map of the
      jail, then return."""
@@ -350,8 +335,7 @@ def umain(rootfs, binds=None, qemu=None, identity=None, cwd=None):
     # see: https://docs.python.org/3/library/os.html#os._exit
     os._exit(0)  # pylint: disable=protected-access
   else:
-    enter(primary_read_fd, primary_write_fd, rootfs, binds, qemu,
-          identity, cwd)
+    enter(primary_read_fd, primary_write_fd, rootfs, binds, identity, cwd)
 
 
 def process_environment(env_dict):
@@ -467,13 +451,11 @@ class Main(ConfigObject):
   def __init__(self,
                rootfs=None,
                binds=None,
-               qemu=None,
                identity=None,
                cwd=None,
                **_):
     self.rootfs = rootfs
     self.binds = get_default(binds, [])
-    self.qemu = qemu
     self.identity = get_default(identity, (0, 0))
 
     uid = os.getuid()
@@ -484,120 +466,28 @@ class Main(ConfigObject):
     umain(**self.as_dict())
 
 
-def parse_config(config_path):
-  """
-  Open the config file as json, strip comments, load it and return the
-  resulting dictionary.
-  """
-
-  stripped_json_str = ''
-
-  # NOTE(josh): strip comments out of the config file.
-  with open(config_path, 'rb') as infile:
-    for line in infile:
-      line = re.sub('//.*$', '', line).rstrip()
-      if line:
-        stripped_json_str += line
-        stripped_json_str += '\n'
-
-  try:
-    return json.loads(stripped_json_str)
-  except (ValueError, KeyError):
-    logging.error('Failed to decode json:\n%s', stripped_json_str)
-    raise
-
-
 # ---
 
-def parse_bool(string):
-  if string.lower() in ('y', 'yes', 't', 'true', '1', 'yup', 'yeah', 'yada'):
-    return True
-  elif string.lower() in ('n', 'no', 'f', 'false', '0', 'nope', 'nah', 'nada'):
-    return False
-
-  logging.warn("Ambiguous truthiness of string '%s' evalutes to 'FALSE'",
-               string)
-  return False
-
-
-def main():
+def main(sys_argv):
   format_str = '%(levelname)-4s %(filename)s[%(lineno)-3s] : %(message)s'
-  logging.basicConfig(level=logging.INFO,
+  logging.basicConfig(level=logging.DEBUG,
                       format=format_str,
                       datefmt='%Y-%m-%d %H:%M:%S',
                       filemode='w')
 
-  parser = argparse.ArgumentParser(description=__doc__)
-  parser.add_argument('--dump-config', action='store_true',
-                      help='Dump default config and exit')
-
-  config = Main().as_dict()  # !!
-  config.update(Exec().as_dict())  # !!
-  config = {'argv': ['id'], 'binds': [], 'env': {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}, 'exbin': '/usr/bin/id', 'qemu': None, 'cwd': '/', 'rootfs': None}
-  config['binds'].extend(('/proc', '/dev/pts', 'tmpfs:/var/tmp'))  # !!
+  rootfs = sys_argv[1]
+  argv = ['id']
+  env = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}
+  exbin = '/usr/bin/id'
+  cwd = '/'  # !!
+  binds = ['/proc', '/dev/pts', 'tmpfs:/var/tmp']
   #config['binds'].extend(('/proc', '/dev/pts'))  # !!
-  config['identity'] = (os.getuid(), os.getgid())  # !!
+  identity = (os.getuid(), os.getgid())  # !!
 
-  for key, value in config.items():
-    if key == 'rootfs':
-      continue
-    # NOTE(josh): argparse store_true isn't what we want here because we want
-    # to distinguish between "not specified" = "default" and "specified"
-    elif isinstance(value, bool):
-      parser.add_argument('--' + key.replace('_', '-'), nargs='?', default=None,
-                          const=True, type=parse_bool, help='HELP')
-    elif isinstance(value, (str, unicode, int, float)) or value is None:
-      parser.add_argument('--' + key.replace('_', '-'))
-    # NOTE(josh): argparse behavior is that if the flag is not specified on
-    # the command line the value will be None, whereas if it's specified with
-    # no arguments then the value will be an empty list. This exactly what we
-    # want since we can ignore `None` values.
-    elif isinstance(value, (list, tuple)):
-      if value:
-        argtype = type(value[0])
-      else:
-        argtype = None
-      parser.add_argument('--' + key.replace('_', '-'), nargs='*',
-                          type=argtype, help='HELP')
-
-  parser.add_argument('rootfs', nargs='?',
-                      help='path of the rootfs to enter')
-  parser.add_argument('remainder', metavar='ARGV',
-                      nargs=argparse.REMAINDER,
-                      help='command and arguments')
-  args = parser.parse_args()
-
-  if args.dump_config:
-    dump_config(sys.stdout)
-    sys.exit(0)
-
-  logging.getLogger().setLevel(getattr(logging, 'DEBUG'))
-
-  if args.remainder:
-    if args.argv is None:
-      args.argv = []
-    args.argv.extend(args.remainder)
-
-  for key, value in vars(args).items():
-    if value is not None and key in config:
-      config[key] = value
-
-  knownkeys = Main.get_field_names() + Exec.get_field_names()
-  unknownkeys = []
-  for key in config:
-    if key.startswith('_'):
-      continue
-
-    if key in knownkeys:
-      continue
-
-    unknownkeys.append(key)
-
-  if unknownkeys:
-    logging.warn("Unrecognized config variables: %s", ", ".join(unknownkeys))
-
+  config = locals()
   mainobj = Main(**config)
   execobj = Exec(**config)
+  #assert 0, mainobj.as_dict().keys()  # binds, cwd, identity, rootfs.
 
   # enter the jail
   mainobj()
@@ -608,4 +498,4 @@ def main():
 
 
 if __name__ == '__main__':
-  sys.exit(main())
+  sys.exit(main(sys.argv))
